@@ -8,7 +8,21 @@ import threading
 from collections import deque
 import customtkinter as ctk
 from PIL import Image
+import tkinter as tk
 import tkinter.filedialog as fd
+
+# Optional macOS overlay helpers (only used if PyObjC is available)
+try:
+    from AppKit import NSApplication  # type: ignore
+    from AppKit import (
+        NSWindowCollectionBehaviorCanJoinAllSpaces,  # type: ignore
+        NSWindowCollectionBehaviorTransient,  # type: ignore
+        NSWindowCollectionBehaviorFullScreenAuxiliary,  # type: ignore
+        NSStatusWindowLevel,  # type: ignore
+    )
+    _HAS_PYOBJC = True
+except Exception:
+    _HAS_PYOBJC = False
 import global_var
 import utilities
 
@@ -36,6 +50,7 @@ MOVEMENT_GAIN = 1.0
 MIN_CONSEC_FRAMES = 2
 CLICK_COOLDOWN = 0.5
 
+
 # ------------------- DWELL (GAZE HOLD) CLICK SETTINGS -------------------
 USE_DWELL_CLICK = True          # Proof-of-concept: dwell-to-left-click
 USE_BLINK_CLICK = False         # Set True if you want to keep blink clicks enabled
@@ -46,12 +61,34 @@ DWELL_ARM_DELAY_SEC = 0.15      # Small delay before dwell starts counting (redu
 DWELL_COOLDOWN_SEC = 0.6        # Prevent immediate double-clicks
 
 # Cursor smoothing (EMA)
-
 CURSOR_SMOOTH_ALPHA = 0.25      # 0..1 (higher = snappier, lower = smoother)
 
 # Test mode: if camera/face isn't available, use the real mouse position as the "gaze cursor"
 TEST_MODE_MOUSE_FALLBACK = True
 TEST_MODE_TICK_SEC = 0.01
+
+# ------------------- DWELL INDICATOR (PROGRESS BAR OVERLAY) -------------------
+# A small bar that follows the cursor and fills based on _dwell_progress.
+SHOW_DWELL_BAR = True
+DWELL_BAR_UPDATE_MS = 33        # ~30 FPS, low overhead
+DWELL_BAR_W = 64                # px
+DWELL_BAR_H = 8                 # px
+DWELL_BAR_BORDER = 1            # px
+DWELL_BAR_OFFSET_X = 0          # px (centered under cursor)
+DWELL_BAR_OFFSET_Y = 22         # px (below cursor)
+DWELL_BAR_HIDE_WHEN_IDLE = True
+DWELL_BAR_ALPHA_FALLBACK = 0.55 # used if transparent color isn't supported
+
+DWELL_BAR_BG = "#ff00ff"         # transparent key color (magenta)
+DWELL_BAR_OUTLINE = "#3a3a3a"    # subtle outline
+DWELL_BAR_FILL = "#00E5FF"       # bright cyan fill
+DWELL_BAR_EMPTY = "#111111"      # background in fallback mode
+
+_dwellbar_win = None
+_dwellbar_canvas = None
+_dwellbar_fill_rect = None
+_dwellbar_outline_rect = None
+_dwellbar_using_transparent = False
 
 # Dwell state
 _dwell_candidate = None         # (x, y) anchor for dwell
@@ -99,6 +136,76 @@ def ema(prev, current, alpha):
     if prev is None:
         return current
     return prev + alpha * (current - prev)
+
+
+def _configure_macos_overlay(tk_toplevel: tk.Toplevel):
+    """macOS: show overlay on all Spaces + over full-screen, and make it click-through."""
+    if not _HAS_PYOBJC:
+        return
+
+    try:
+        app = NSApplication.sharedApplication()
+        try:
+            tk_toplevel.update_idletasks()
+        except Exception:
+            pass
+
+        wins = list(app.windows())
+        if not wins:
+            return
+
+        # Try to match the correct native window via title
+        desired_title = ""
+        try:
+            desired_title = tk_toplevel.title()
+        except Exception:
+            desired_title = ""
+
+        target = None
+        if desired_title:
+            for w in reversed(wins):
+                try:
+                    if str(w.title()) == str(desired_title):
+                        target = w
+                        break
+                except Exception:
+                    continue
+
+        if target is None:
+            # Fallback: last window
+            target = wins[-1]
+
+        # Always-on-top
+        try:
+            target.setLevel_(NSStatusWindowLevel)
+        except Exception:
+            pass
+
+        # Click-through
+        try:
+            target.setIgnoresMouseEvents_(True)
+        except Exception:
+            pass
+
+        # Key: show on all Spaces + over full-screen
+        try:
+            behavior = (
+                NSWindowCollectionBehaviorCanJoinAllSpaces
+                | NSWindowCollectionBehaviorFullScreenAuxiliary
+                | NSWindowCollectionBehaviorTransient
+            )
+            target.setCollectionBehavior_(behavior)
+        except Exception:
+            pass
+
+        # Don’t hide when app deactivates
+        try:
+            target.setHidesOnDeactivate_(False)
+        except Exception:
+            pass
+
+    except Exception:
+        return
 
 
 def dwell_update_and_maybe_click(cur_x, cur_y, now):
@@ -152,6 +259,153 @@ def dwell_update_and_maybe_click(cur_x, cur_y, now):
         _dwell_progress = 0.0
 
     return _dwell_progress
+
+
+# ------------------- DWELL PROGRESS BAR (UI OVERLAY) -------------------
+def init_dwell_bar_overlay(parent):
+    """Create a tiny always-on-top overlay window that shows dwell progress as a loading bar."""
+    global _dwellbar_win, _dwellbar_canvas, _dwellbar_fill_rect, _dwellbar_outline_rect, _dwellbar_using_transparent
+
+    if not SHOW_DWELL_BAR:
+        return
+
+    if _dwellbar_win is not None:
+        return
+
+    win = tk.Toplevel(parent)
+    win.overrideredirect(True)
+    win.attributes("-topmost", True)
+
+    # Unique title so we can locate the native NSWindow reliably
+    try:
+        win.title("EyeOS_DwellBarOverlay")
+    except Exception:
+        pass
+
+    # macOS: keep overlay on top of full-screen apps and ignore mouse events
+    _configure_macos_overlay(win)
+
+    # Retry once shortly after creation (native NSWindow can appear a tick later)
+    try:
+        parent.after(200, lambda: _configure_macos_overlay(win))
+    except Exception:
+        pass
+    # Never steal focus (critical on macOS)
+    try:
+        win.attributes("-takefocus", 0)
+    except Exception:
+        pass
+
+    # Prefer true transparency via transparent color; fall back to alpha with a dark background.
+    _dwellbar_using_transparent = False
+    try:
+        win.configure(bg=DWELL_BAR_BG)
+        win.wm_attributes("-transparentcolor", DWELL_BAR_BG)
+        _dwellbar_using_transparent = True
+    except Exception:
+        win.configure(bg=DWELL_BAR_EMPTY)
+        try:
+            win.attributes("-alpha", DWELL_BAR_ALPHA_FALLBACK)
+        except Exception:
+            pass
+
+    win.geometry(f"{DWELL_BAR_W}x{DWELL_BAR_H}+0+0")
+
+    canvas = tk.Canvas(
+        win,
+        width=DWELL_BAR_W,
+        height=DWELL_BAR_H,
+        highlightthickness=0,
+        bd=0,
+        bg=DWELL_BAR_BG if _dwellbar_using_transparent else win["bg"],
+    )
+    canvas.pack(fill="both", expand=True)
+
+    x0 = DWELL_BAR_BORDER
+    y0 = DWELL_BAR_BORDER
+    x1 = DWELL_BAR_W - DWELL_BAR_BORDER
+    y1 = DWELL_BAR_H - DWELL_BAR_BORDER
+
+    # Outline
+    outline = canvas.create_rectangle(
+        x0, y0, x1, y1,
+        outline=DWELL_BAR_OUTLINE,
+        width=1,
+    )
+
+    # Fill (starts empty)
+    fill = canvas.create_rectangle(
+        x0, y0, x0, y1,
+        outline="",
+        fill=DWELL_BAR_FILL,
+        width=0,
+    )
+
+    _dwellbar_win = win
+    _dwellbar_canvas = canvas
+    _dwellbar_outline_rect = outline
+    _dwellbar_fill_rect = fill
+
+    # Start fully transparent (avoid withdraw/deiconify which can trigger Space switches on macOS)
+    try:
+        win.attributes("-alpha", 0.0)
+    except Exception:
+        pass
+
+
+def update_dwell_bar_overlay():
+    """Update bar position/fill based on _dwell_progress. Scheduled via root.after()."""
+    global _dwellbar_win, _dwellbar_canvas, _dwellbar_fill_rect, _dwellbar_outline_rect
+
+    if not SHOW_DWELL_BAR:
+        return
+
+    if _dwellbar_win is None or _dwellbar_canvas is None or _dwellbar_fill_rect is None:
+        return
+
+    try:
+        active = (_dwell_candidate is not None) or (_dwell_progress > 0.0)
+
+        # Follow cursor (uses OS cursor position; works in both gaze mode and test mode)
+        cx, cy = pyautogui.position()
+        x = int(cx - (DWELL_BAR_W // 2) + DWELL_BAR_OFFSET_X)
+        y = int(cy + DWELL_BAR_OFFSET_Y)
+        _dwellbar_win.geometry(f"{DWELL_BAR_W}x{DWELL_BAR_H}+{x}+{y}")
+
+        # Fade instead of withdraw/deiconify to avoid macOS Space switches
+        if DWELL_BAR_HIDE_WHEN_IDLE and not active:
+            try:
+                _dwellbar_win.attributes("-alpha", 0.0)
+            except Exception:
+                pass
+        else:
+            try:
+                # If transparentcolor worked, use fully opaque; otherwise use the fallback alpha
+                alpha = 1.0 if _dwellbar_using_transparent else DWELL_BAR_ALPHA_FALLBACK
+                _dwellbar_win.attributes("-alpha", alpha)
+            except Exception:
+                pass
+
+        # Compute fill width
+        p = max(0.0, min(1.0, float(_dwell_progress)))
+        x0 = DWELL_BAR_BORDER
+        y0 = DWELL_BAR_BORDER
+        x1 = DWELL_BAR_W - DWELL_BAR_BORDER
+        y1 = DWELL_BAR_H - DWELL_BAR_BORDER
+        fill_x1 = int(x0 + p * (x1 - x0))
+
+        _dwellbar_canvas.coords(_dwellbar_fill_rect, x0, y0, fill_x1, y1)
+
+        # Subtle outline brightening when progress is active
+        if _dwell_progress > 0.0:
+            _dwellbar_canvas.itemconfigure(_dwellbar_outline_rect, outline="#5a5a5a")
+        else:
+            _dwellbar_canvas.itemconfigure(_dwellbar_outline_rect, outline=DWELL_BAR_OUTLINE)
+
+        # Reschedule (non-blocking)
+        root.after(DWELL_BAR_UPDATE_MS, update_dwell_bar_overlay)
+    except Exception:
+        return
 
 
 # ------------------- TRACKING LOOP -------------------
@@ -440,10 +694,15 @@ def open_settings():
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
+
 root = ctk.CTk()
 root.title("EyeOS Control")
 root.geometry("800x70")
 root.resizable(False, False)
+
+# Dwell progress bar overlay (runs in parallel via Tk's event loop; no blocking)
+init_dwell_bar_overlay(root)
+root.after(DWELL_BAR_UPDATE_MS, update_dwell_bar_overlay)
 
 bar = ctk.CTkFrame(root)
 bar.pack(fill="both", expand=True, padx=8, pady=8)
