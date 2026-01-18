@@ -36,6 +36,35 @@ MOVEMENT_GAIN = 1.0
 MIN_CONSEC_FRAMES = 2
 CLICK_COOLDOWN = 0.5
 
+# ------------------- DWELL (GAZE HOLD) CLICK SETTINGS -------------------
+USE_DWELL_CLICK = True          # Proof-of-concept: dwell-to-left-click
+USE_BLINK_CLICK = False         # Set True if you want to keep blink clicks enabled
+
+DWELL_TIME_SEC = 1.2            # How long you must hold gaze to click
+DWELL_RADIUS_PX = 45            # How far the cursor can drift while "holding"
+DWELL_ARM_DELAY_SEC = 0.15      # Small delay before dwell starts counting (reduces accidental starts)
+DWELL_COOLDOWN_SEC = 0.6        # Prevent immediate double-clicks
+
+# Cursor smoothing (EMA)
+
+CURSOR_SMOOTH_ALPHA = 0.25      # 0..1 (higher = snappier, lower = smoother)
+
+# Test mode: if camera/face isn't available, use the real mouse position as the "gaze cursor"
+TEST_MODE_MOUSE_FALLBACK = True
+TEST_MODE_TICK_SEC = 0.01
+
+# Dwell state
+_dwell_candidate = None         # (x, y) anchor for dwell
+_dwell_arm_start = 0.0
+_dwell_start = 0.0
+_dwell_cooldown_until = 0.0
+_dwell_progress = 0.0
+_last_progress_print = 0.0
+
+# Smoothed cursor position
+_sx = None
+_sy = None
+
 # Blink counters
 left_counter = 0
 right_counter = 0
@@ -60,10 +89,77 @@ def get_ear(landmarks, indices):
     return (vertical1 + vertical2) / (2.0 * horizontal)
 
 
+def dist2(a, b):
+    dx = a[0] - b[0]
+    dy = a[1] - b[1]
+    return dx * dx + dy * dy
+
+
+def ema(prev, current, alpha):
+    if prev is None:
+        return current
+    return prev + alpha * (current - prev)
+
+
+def dwell_update_and_maybe_click(cur_x, cur_y, now):
+    """Update dwell state from a cursor position (gaze OR mouse fallback). Returns dwell progress (0..1)."""
+    global _dwell_candidate, _dwell_arm_start, _dwell_start, _dwell_cooldown_until, _dwell_progress
+
+    if not USE_DWELL_CLICK:
+        _dwell_progress = 0.0
+        return _dwell_progress
+
+    # Respect cooldown
+    if now < _dwell_cooldown_until:
+        _dwell_progress = 0.0
+        return _dwell_progress
+
+    cur = (int(cur_x), int(cur_y))
+
+    # If no candidate yet, (re)arm on current position
+    if _dwell_candidate is None:
+        _dwell_candidate = cur
+        _dwell_arm_start = now
+        _dwell_start = 0.0
+        _dwell_progress = 0.0
+        return _dwell_progress
+
+    # If cursor wandered too far, reset candidate
+    if dist2(cur, _dwell_candidate) > (DWELL_RADIUS_PX * DWELL_RADIUS_PX):
+        _dwell_candidate = cur
+        _dwell_arm_start = now
+        _dwell_start = 0.0
+        _dwell_progress = 0.0
+        return _dwell_progress
+
+    # Within radius: after a short arm delay, start counting dwell time
+    if _dwell_start == 0.0:
+        if (now - _dwell_arm_start) >= DWELL_ARM_DELAY_SEC:
+            _dwell_start = now
+            _dwell_progress = 0.0
+        return _dwell_progress
+
+    elapsed = now - _dwell_start
+    _dwell_progress = max(0.0, min(1.0, elapsed / DWELL_TIME_SEC))
+
+    if elapsed >= DWELL_TIME_SEC:
+        pyautogui.click(button="left")
+        print("Dwell → LEFT CLICK")
+        _dwell_cooldown_until = now + DWELL_COOLDOWN_SEC
+        _dwell_candidate = None
+        _dwell_arm_start = 0.0
+        _dwell_start = 0.0
+        _dwell_progress = 0.0
+
+    return _dwell_progress
+
+
 # ------------------- TRACKING LOOP -------------------
 def tracking_loop():
     global left_counter, right_counter, last_left_click, last_right_click
     global EAR_THRESHOLD_LEFT, EAR_THRESHOLD_RIGHT, MOVEMENT_GAIN
+    global _dwell_candidate, _dwell_arm_start, _dwell_start, _dwell_cooldown_until, _dwell_progress, _last_progress_print
+    global _sx, _sy
 
     global cap
     cap = cv2.VideoCapture(utilities.get_camera_input())
@@ -76,6 +172,19 @@ def tracking_loop():
             cap = cv2.VideoCapture(utilities.get_camera_input())
 
         if cap is None or not cap.isOpened():
+            # Test mode fallback: allow dwell-click testing using the physical mouse
+            if TEST_MODE_MOUSE_FALLBACK and tracking_active.is_set():
+                now = time.time()
+                mx, my = pyautogui.position()
+                dwell_update_and_maybe_click(mx, my, now)
+
+                if now - _last_progress_print > 0.5:
+                    _last_progress_print = now
+                    print(f"[TEST MODE] Dwell progress: {_dwell_progress:.2f}")
+
+                time.sleep(TEST_MODE_TICK_SEC)
+            else:
+                time.sleep(0.05)
             continue
 
         if not tracking_active.is_set():
@@ -92,7 +201,7 @@ def tracking_loop():
 
         if results.multi_face_landmarks:
             landmarks = results.multi_face_landmarks[0].landmark
-
+    
             # Cursor movement
             left_center = landmarks[473]
             right_center = landmarks[468]
@@ -110,37 +219,66 @@ def tracking_loop():
             target_x = int(norm_x * screen_width * gain)
             target_y = int(norm_y * screen_height * gain)
 
-            pyautogui.moveTo(target_x, target_y)
+            # Smooth the cursor to reduce jitter before dwell logic
+            _sx = ema(_sx, float(target_x), CURSOR_SMOOTH_ALPHA)
+            _sy = ema(_sy, float(target_y), CURSOR_SMOOTH_ALPHA)
+            sx_i = int(_sx)
+            sy_i = int(_sy)
 
-            # EAR blink detection
-            ear_left = get_ear(landmarks, LEFT_EYE)
-            ear_right = get_ear(landmarks, RIGHT_EYE)
-            ear_queue_left.append(ear_left)
-            ear_queue_right.append(ear_right)
-            avg_ear_left = sum(ear_queue_left) / len(ear_queue_left)
-            avg_ear_right = sum(ear_queue_right) / len(ear_queue_right)
+            pyautogui.moveTo(sx_i, sy_i)
 
+            # ------------------- DWELL (GAZE HOLD) CLICK -------------------
             now = time.time()
+            dwell_update_and_maybe_click(sx_i, sy_i, now)
 
-            # Left blink
-            if avg_ear_left < EAR_THRESHOLD_LEFT:
-                left_counter += 1
-            else:
-                if left_counter >= MIN_CONSEC_FRAMES and now - last_left_click > CLICK_COOLDOWN:
-                    pyautogui.click(button="left")
-                    print("Left blink → LEFT CLICK")
-                    last_left_click = now
-                left_counter = 0
+            # Light debug print (twice per second max)
+            if now - _last_progress_print > 0.5:
+                _last_progress_print = now
+                if _dwell_candidate is not None:
+                    print(f"Dwell progress: {_dwell_progress:.2f}")
 
-            # Right blink
-            if avg_ear_right < EAR_THRESHOLD_RIGHT:
-                right_counter += 1
+            if USE_BLINK_CLICK:
+                # EAR blink detection
+                ear_left = get_ear(landmarks, LEFT_EYE)
+                ear_right = get_ear(landmarks, RIGHT_EYE)
+                ear_queue_left.append(ear_left)
+                ear_queue_right.append(ear_right)
+                avg_ear_left = sum(ear_queue_left) / len(ear_queue_left)
+                avg_ear_right = sum(ear_queue_right) / len(ear_queue_right)
+
+                # Left blink
+                if avg_ear_left < EAR_THRESHOLD_LEFT:
+                    left_counter += 1
+                else:
+                    if left_counter >= MIN_CONSEC_FRAMES and now - last_left_click > CLICK_COOLDOWN:
+                        pyautogui.click(button="left")
+                        print("Left blink → LEFT CLICK")
+                        last_left_click = now
+                    left_counter = 0
+
+                # Right blink
+                if avg_ear_right < EAR_THRESHOLD_RIGHT:
+                    right_counter += 1
+                else:
+                    if right_counter >= MIN_CONSEC_FRAMES and now - last_right_click > CLICK_COOLDOWN:
+                        pyautogui.click(button="right")
+                        print("Right blink → RIGHT CLICK")
+                        last_right_click = now
+                    right_counter = 0
+        else:
+            # No face detected: test mode fallback using the physical mouse
+            if TEST_MODE_MOUSE_FALLBACK:
+                now = time.time()
+                mx, my = pyautogui.position()
+                dwell_update_and_maybe_click(mx, my, now)
+
+                if now - _last_progress_print > 0.5:
+                    _last_progress_print = now
+                    print(f"[TEST MODE: no face] Dwell progress: {_dwell_progress:.2f}")
+
+                time.sleep(TEST_MODE_TICK_SEC)
             else:
-                if right_counter >= MIN_CONSEC_FRAMES and now - last_right_click > CLICK_COOLDOWN:
-                    pyautogui.click(button="right")
-                    print("Right blink → RIGHT CLICK")
-                    last_right_click = now
-                right_counter = 0
+                time.sleep(0.05)
 
     if cap:
         cap.release()
