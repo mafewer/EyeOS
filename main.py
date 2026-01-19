@@ -66,6 +66,22 @@ CURSOR_SMOOTH_ALPHA = 0.25      # 0..1 (higher = snappier, lower = smoother)
 # Test mode: if camera/face isn't available, use the real mouse position as the "gaze cursor"
 TEST_MODE_MOUSE_FALLBACK = True
 TEST_MODE_TICK_SEC = 0.01
+CLICK_MODE = "left"          # "left" | "right"
+CLICK_MODE_ONESHOT = True    # if True, right click returns to left after one click
+
+# ------------------- GAZE ZONES (CORNER HOLDS) -------------------
+# Hands-free mode switching without interacting with the EyeOS window.
+GAZE_ZONES_ENABLED = True
+GAZE_ZONE_SIZE_PX = 90           # size of each corner zone (square)
+GAZE_ZONE_HOLD_SEC = 0.55        # hold time inside a corner to trigger
+GAZE_ZONE_COOLDOWN_SEC = 0.90    # prevents rapid retriggers without leaving
+
+CLICKING_ENABLED = True          # bottom-left toggles this safety on/off
+
+_zone_name = None                # "TL" | "TR" | "BL" | "BR" | None
+_zone_enter_time = 0.0
+_zone_fired = False
+_zone_last_fire = 0.0
 
 # ------------------- DWELL INDICATOR (PROGRESS BAR OVERLAY) -------------------
 # A small bar that follows the cursor and fills based on _dwell_progress.
@@ -207,12 +223,136 @@ def _configure_macos_overlay(tk_toplevel: tk.Toplevel):
     except Exception:
         return
 
+# ------------------- GAZE ZONES (CORNER HOLDS) -------------------
+def reset_dwell_state():
+    """Clear dwell state so corner holds never accidentally trigger a click."""
+    global _dwell_candidate, _dwell_arm_start, _dwell_start, _dwell_progress
+    _dwell_candidate = None
+    _dwell_arm_start = 0.0
+    _dwell_start = 0.0
+    _dwell_progress = 0.0
+
+
+def set_click_mode_left():
+    global CLICK_MODE
+    CLICK_MODE = "left"
+    try:
+        if CLICKING_ENABLED:
+            click_mode_lbl.configure(text="Click: Left")
+        else:
+            click_mode_lbl.configure(text="Click: OFF")
+    except Exception:
+        pass
+
+
+def arm_right_click_next():
+    """Arm a one-shot right click for the next dwell click (gaze-zones use this)."""
+    global CLICK_MODE
+    CLICK_MODE = "right"
+    try:
+        if CLICKING_ENABLED:
+            click_mode_lbl.configure(text="Click: Right (next)")
+        else:
+            click_mode_lbl.configure(text="Click: OFF")
+    except Exception:
+        pass
+    print("Armed: RIGHT CLICK (next dwell)")
+
+
+def toggle_clicking_enabled():
+    global CLICKING_ENABLED
+    CLICKING_ENABLED = not CLICKING_ENABLED
+    reset_dwell_state()
+    try:
+        if CLICKING_ENABLED:
+            if CLICK_MODE == "right":
+                click_mode_lbl.configure(text="Click: Right (next)")
+            else:
+                click_mode_lbl.configure(text="Click: Left")
+        else:
+            click_mode_lbl.configure(text="Click: OFF")
+    except Exception:
+        pass
+    print(f"CLICKING_ENABLED = {CLICKING_ENABLED}")
+
+
+def _zone_at(x: int, y: int):
+    z = GAZE_ZONE_SIZE_PX
+    if x <= z and y <= z:
+        return "TL"
+    if x >= (screen_width - z) and y <= z:
+        return "TR"
+    if x <= z and y >= (screen_height - z):
+        return "BL"
+    if x >= (screen_width - z) and y >= (screen_height - z):
+        return "BR"
+    return None
+
+
+def handle_gaze_zones(x: int, y: int, now: float) -> bool:
+    """Return True if we're currently in a gaze-zone (caller should skip dwell).
+
+    TL: force left
+    TR: arm right-click (next)
+    BL: toggle clicking on/off
+    BR: cancel/reset (force left + reset dwell)
+    """
+    global _zone_name, _zone_enter_time, _zone_fired, _zone_last_fire
+
+    if not GAZE_ZONES_ENABLED:
+        return False
+
+    zone = _zone_at(int(x), int(y))
+
+    # Zone transitions reset timer/fired state
+    if zone != _zone_name:
+        _zone_name = zone
+        _zone_enter_time = now
+        _zone_fired = False
+
+    if zone is None:
+        return False
+
+    # While holding a zone, never allow dwell to accumulate
+    reset_dwell_state()
+
+    # Cooldown protection
+    if (now - _zone_last_fire) < GAZE_ZONE_COOLDOWN_SEC:
+        return True
+
+    held = (now - _zone_enter_time)
+    if (not _zone_fired) and held >= GAZE_ZONE_HOLD_SEC:
+        _zone_fired = True
+        _zone_last_fire = now
+
+        if zone == "TL":
+            set_click_mode_left()
+            print("[ZONE TL] Force LEFT")
+        elif zone == "TR":
+            arm_right_click_next()
+            print("[ZONE TR] Arm RIGHT (next)")
+        elif zone == "BL":
+            toggle_clicking_enabled()
+            print("[ZONE BL] Toggle CLICKING")
+        elif zone == "BR":
+            set_click_mode_left()
+            reset_dwell_state()
+            print("[ZONE BR] Cancel / reset")
+
+    return True
+
 
 def dwell_update_and_maybe_click(cur_x, cur_y, now):
     """Update dwell state from a cursor position (gaze OR mouse fallback). Returns dwell progress (0..1)."""
     global _dwell_candidate, _dwell_arm_start, _dwell_start, _dwell_cooldown_until, _dwell_progress
+    global CLICK_MODE
 
     if not USE_DWELL_CLICK:
+        _dwell_progress = 0.0
+        return _dwell_progress
+
+    # Safety: allow cursor movement while disabling clicks
+    if not CLICKING_ENABLED:
         _dwell_progress = 0.0
         return _dwell_progress
 
@@ -250,16 +390,31 @@ def dwell_update_and_maybe_click(cur_x, cur_y, now):
     _dwell_progress = max(0.0, min(1.0, elapsed / DWELL_TIME_SEC))
 
     if elapsed >= DWELL_TIME_SEC:
-        pyautogui.click(button="left")
-        print("Dwell → LEFT CLICK")
+        if CLICK_MODE == "right":
+            pyautogui.click(button="right")
+            print("Dwell → RIGHT CLICK")
+        else:
+            pyautogui.click(button="left")
+            print("Dwell → LEFT CLICK")
+
+        # One-shot right click snaps back to left
+        if CLICK_MODE_ONESHOT and CLICK_MODE == "right":
+            CLICK_MODE = "left"
+            try:
+                click_mode_lbl.configure(text="Click: Left")
+            except Exception:
+                pass
+
         _dwell_cooldown_until = now + DWELL_COOLDOWN_SEC
         _dwell_candidate = None
         _dwell_arm_start = 0.0
         _dwell_start = 0.0
         _dwell_progress = 0.0
-
     return _dwell_progress
 
+def arm_right_click_once():
+    """Arm a one-shot right click for the next dwell click."""
+    arm_right_click_next()
 
 # ------------------- DWELL PROGRESS BAR (UI OVERLAY) -------------------
 def init_dwell_bar_overlay(parent):
@@ -430,7 +585,9 @@ def tracking_loop():
             if TEST_MODE_MOUSE_FALLBACK and tracking_active.is_set():
                 now = time.time()
                 mx, my = pyautogui.position()
-                dwell_update_and_maybe_click(mx, my, now)
+                in_zone = handle_gaze_zones(mx, my, now)
+                if not in_zone:
+                    dwell_update_and_maybe_click(mx, my, now)
 
                 if now - _last_progress_print > 0.5:
                     _last_progress_print = now
@@ -483,8 +640,9 @@ def tracking_loop():
 
             # ------------------- DWELL (GAZE HOLD) CLICK -------------------
             now = time.time()
-            dwell_update_and_maybe_click(sx_i, sy_i, now)
-
+            in_zone = handle_gaze_zones(sx_i, sy_i, now)
+            if not in_zone:
+                dwell_update_and_maybe_click(sx_i, sy_i, now)
             # Light debug print (twice per second max)
             if now - _last_progress_print > 0.5:
                 _last_progress_print = now
@@ -524,8 +682,9 @@ def tracking_loop():
             if TEST_MODE_MOUSE_FALLBACK:
                 now = time.time()
                 mx, my = pyautogui.position()
-                dwell_update_and_maybe_click(mx, my, now)
-
+                in_zone = handle_gaze_zones(mx, my, now)
+                if not in_zone:
+                    dwell_update_and_maybe_click(mx, my, now)
                 if now - _last_progress_print > 0.5:
                     _last_progress_print = now
                     print(f"[TEST MODE: no face] Dwell progress: {_dwell_progress:.2f}")
@@ -699,6 +858,10 @@ root = ctk.CTk()
 root.title("EyeOS Control")
 root.geometry("800x70")
 root.resizable(False, False)
+try:
+    root.attributes("-topmost", True)
+except Exception:
+    pass
 
 # Dwell progress bar overlay (runs in parallel via Tk's event loop; no blocking)
 init_dwell_bar_overlay(root)
@@ -723,6 +886,18 @@ toggle_btn.pack(side="left", padx=4)
 
 status_lbl = ctk.CTkLabel(bar, text="Status: Idle")
 status_lbl.pack(side="left", padx=10)
+
+click_mode_lbl = ctk.CTkLabel(bar, text="Click: Left")
+click_mode_lbl.pack(side="left", padx=10)
+
+right_click_btn = ctk.CTkButton(
+    bar,
+    text="Right Click",
+    width=110,
+    command=arm_right_click_once,
+    font=("Arial", 13),
+)
+right_click_btn.pack(side="left", padx=4)
 
 voice_btn = ctk.CTkButton(bar, text="Voice", image=voice_icon, command=lambda: print("Voice Pressed"), compound="left", font=("Arial", 13))
 voice_btn.pack(side="left", padx=4)
