@@ -20,6 +20,11 @@ class Command:
     name: str
     phrases: tuple[str, ...]
     action: Callable[[], None]
+    description: str = ""
+
+    @property
+    def activation_phrase(self) -> str:
+        return self.phrases[0] if self.phrases else ""
 
 _KEY_ALIASES: dict[str, Key] = {
     "cmd": Key.cmd,
@@ -42,6 +47,67 @@ _KEY_ALIASES: dict[str, Key] = {
     "left": Key.left,
     "right": Key.right,
 }
+
+_KEY_LABELS: dict[str, str] = {
+    "cmd": "Cmd",
+    "command": "Cmd",
+    "ctrl": "Ctrl",
+    "control": "Ctrl",
+    "alt": "Alt",
+    "option": "Alt",
+    "shift": "Shift",
+    "enter": "Enter",
+    "return": "Enter",
+    "tab": "Tab",
+    "space": "Space",
+    "esc": "Esc",
+    "escape": "Esc",
+    "backspace": "Backspace",
+    "delete": "Delete",
+    "up": "Up",
+    "down": "Down",
+    "left": "Left",
+    "right": "Right",
+}
+
+
+def _title_from_name(name: str) -> str:
+    return (name or "").replace("_", " ").strip().title()
+
+
+def _format_hotkey(keys: list[Any]) -> str:
+    labels: list[str] = []
+    for key in keys:
+        token = str(key or "").strip().lower()
+        if not token:
+            continue
+        if token in _KEY_LABELS:
+            labels.append(_KEY_LABELS[token])
+        elif len(token) == 1 and token.isalpha():
+            labels.append(token.upper())
+        else:
+            labels.append(token.capitalize())
+    return " + ".join(labels)
+
+
+def _description_from_action(name: str, action_spec: dict[str, Any]) -> str:
+    action_type = str(action_spec.get("type") or "").strip().lower()
+    if action_type == "open_app":
+        app = str(action_spec.get("app") or "").strip()
+        return f"Open {app}" if app else f"Open {_title_from_name(name)}"
+    if action_type == "open_url":
+        url = str(action_spec.get("url") or "").strip()
+        return f"Open {url}" if url else f"Open {_title_from_name(name)}"
+    if action_type == "type_text":
+        return f"Type text for {_title_from_name(name)}"
+    if action_type == "hotkey":
+        keys = action_spec.get("keys")
+        if isinstance(keys, list):
+            combo = _format_hotkey(keys)
+            if combo:
+                return f"Press {combo}"
+        return f"Run {_title_from_name(name)}"
+    return f"Run {_title_from_name(name)}"
 
 
 def _as_key(k: str) -> Key | str:
@@ -138,7 +204,10 @@ def load_command_pack(pack_path: str | os.PathLike[str], os_keyboard: Controller
         if not ph:
             continue
         action = _action_from_spec(action_spec, os_keyboard)
-        cmds.append(Command(name=name, phrases=ph, action=action))
+        description = str(item.get("description") or "").strip()
+        if not description:
+            description = _description_from_action(name, action_spec)
+        cmds.append(Command(name=name, phrases=ph, action=action, description=description))
 
     return cmds
 
@@ -197,25 +266,30 @@ def build_commands(os_keyboard: Controller) -> list[Command]:
             name="open_safari",
             phrases=("open safari", "safari", "launch safari"),
             action=lambda: open_app("Safari"),
+            description="Open Safari",
         ),
         Command(
             name="close_window",
             phrases=("close window", "close this", "close tab"),
             action=close_window,
+            description="Close the current window or tab",
         ),
         Command(
             name="open_whatsapp",
             phrases=("open whatsapp", "whatsapp", "launch whatsapp"),
             action=lambda: open_app("WhatsApp"),
+            description="Open WhatsApp",
         ),
         Command(
             name="open_mun",
             phrases=("open mun", "open online mun", "mun login"),
             action=lambda: open_url("https://online.mun.ca"),
+            description="Open the MUN login page",
         ),
         Command(
             name="stop_listening",
             phrases=("stop listening", "voice off", "disable commands"),
             action=noop,
+            description="Disable command mode",
         ),
     ]
